@@ -16,9 +16,23 @@ services:
     build:
       context: .
       dockerfile: Dockerfile
+      args:
+        TARGET_APP: api
     container_name: sysmon-api
     ports:
       - "8080:8080"
+    environment:
+      MONGO_URI: "mongodb://root:secretpassword@mongodb:27017"
+    depends_on:
+      - mongodb
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TARGET_APP: worker
+    container_name: sysmon-worker
     environment:
       MONGO_URI: "mongodb://root:secretpassword@mongodb:27017"
     depends_on:

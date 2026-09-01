@@ -7,7 +7,8 @@ RUN go mod download
 
 COPY . .
 
-RUN CGO_ENABLED=0 GOOS=linux go build -o /sysmon-api ./cmd/api/main.go
+ARG TARGET_APP=api
+RUN CGO_ENABLED=0 GOOS=linux go build -o /sysmon-app ./cmd/${TARGET_APP}/main.go
 
 FROM alpine:latest
 
@@ -15,8 +16,8 @@ RUN apk --no-cache add ca-certificates
 
 WORKDIR /root/
 
-COPY --from=builder /sysmon-api .
+COPY --from=builder /sysmon-app .
 
 EXPOSE 8080
 
-CMD ["./sysmon-api"]
+CMD ["./sysmon-app"]
