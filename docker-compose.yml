@@ -1,0 +1,28 @@
+version: '3.8'
+
+services:
+  mongodb:
+    image: mongo:latest
+    container_name: sysmon-mongo
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: root
+      MONGO_INITDB_ROOT_PASSWORD: secretpassword
+    volumes:
+      - mongo_data:/data/db
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sysmon-api
+    ports:
+      - "8080:8080"
+    environment:
+      MONGO_URI: "mongodb://root:secretpassword@mongodb:27017"
+    depends_on:
+      - mongodb
+
+volumes:
+  mongo_data:
