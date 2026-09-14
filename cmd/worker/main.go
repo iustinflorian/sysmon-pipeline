@@ -2,12 +2,14 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"time"
 
+	amqp "github.com/rabbitmq/amqp091-go"
 	"go.mongodb.org/mongo-driver/v2/bson"
 	"go.mongodb.org/mongo-driver/v2/mongo"
 	"go.mongodb.org/mongo-driver/v2/mongo/options"
@@ -21,26 +23,64 @@ type Target struct {
 	CreatedAt time.Time     `json:"created_at" bson:"created_at"`
 }
 
+type IncidentEvent struct {
+	TargetID  string    `json:"target_id"`
+	URL       string    `json:"url"`
+	Status    string    `json:"status"`
+	Timestamp time.Time `json:"timestamp"`
+}
+
 func main() {
-	uri := os.Getenv("MONGO_URI")
-	if uri == "" {
-		uri = "mongodb://root:secretpassword@localhost:27017"
+	mongoURI := os.Getenv("MONGO_URI")
+	if mongoURI == "" {
+		mongoURI = "mongodb://root:secretpassword@localhost:27017"
+	}
+
+	rabbitURI := os.Getenv("RABBITMQ_URI")
+	if rabbitURI == "" {
+		rabbitURI = "amqp://guest:guest@localhost:5672/"
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
-	client, err := mongo.Connect(options.Client().ApplyURI(uri))
+	mongoClient, err := mongo.Connect(options.Client().ApplyURI(mongoURI))
 	if err != nil {
 		log.Fatalf("Worker failed connection to MongoDB: %v", err)
 	}
 
-	if err := client.Ping(ctx, nil); err != nil {
+	if err := mongoClient.Ping(ctx, nil); err != nil {
 		log.Fatalf("Worker MongoDB ping failed: %v", err)
 	}
 	fmt.Println("Worker connected to MongoDB successfully!")
 
-	collection := client.Database("sysmon").Collection("targets")
+	var rabbitConn *amqp.Connection
+	for range 5 {
+		rabbitConn, err = amqp.Dial(rabbitURI)
+		if err == nil {
+			break
+		}
+		fmt.Println("Waiting for RabbitMQ to be ready...")
+		time.Sleep(2 * time.Second)
+	}
+	if err != nil {
+		log.Fatalf("Failed to connect to RabbitMQ: %v", err)
+	}
+	defer rabbitConn.Close()
+
+	ch, err := rabbitConn.Channel()
+	if err != nil {
+		log.Fatalf("Failed to open RabbitMQ channel: %v", err)
+	}
+	defer ch.Close()
+
+	q, err := ch.QueueDeclare("incidents", true, false, false, false, nil)
+	if err != nil {
+		log.Fatalf("Failed to declare RabbitMQ queue: %v", err)
+	}
+	fmt.Println("Worker connected to RabbitMQ and declared 'incidents' queue!")
+
+	collection := mongoClient.Database("sysmon").Collection("targets")
 
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()
@@ -50,11 +90,11 @@ func main() {
 	}
 
 	for range ticker.C {
-		pollTargets(collection, httpClient)
+		pollTargets(collection, httpClient, ch, q.Name)
 	}
 }
 
-func pollTargets(collection *mongo.Collection, client *http.Client) {
+func pollTargets(collection *mongo.Collection, client *http.Client, ch *amqp.Channel, queueName string) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
@@ -72,11 +112,11 @@ func pollTargets(collection *mongo.Collection, client *http.Client) {
 	}
 
 	for _, target := range targets {
-		go probeTarget(collection, client, target)
+		go probeTarget(collection, client, target, ch, queueName)
 	}
 }
 
-func probeTarget(collection *mongo.Collection, client *http.Client, target Target) {
+func probeTarget(collection *mongo.Collection, client *http.Client, target Target, ch *amqp.Channel, queueName string) {
 	resp, err := client.Get(target.URL)
 	newStatus := "DOWN"
 
@@ -104,4 +144,40 @@ func probeTarget(collection *mongo.Collection, client *http.Client, target Targe
 	}
 
 	fmt.Printf("Target %s status changed: %s -> %s\n", target.URL, target.Status, newStatus)
+
+	if newStatus == "DOWN" {
+		publishIncidentEvent(ch, queueName, target)
+	}
+}
+
+func publishIncidentEvent(ch *amqp.Channel, queueName string, target Target) {
+	event := IncidentEvent{
+		TargetID:  target.ID.Hex(),
+		URL:       target.URL,
+		Status:    "DOWN",
+		Timestamp: time.Now(),
+	}
+
+	body, err := json.Marshal(event)
+	if err != nil {
+		log.Printf("Failed to marshal incident event: %v", err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	err = ch.PublishWithContext(ctx, "", queueName, false, false,
+		amqp.Publishing{
+			ContentType: "application/json",
+			Body:        body,
+		},
+	)
+
+	if err != nil {
+		log.Printf("Failed to publish incident event to RabbitMQ: %v", err)
+		return
+	}
+
+	fmt.Printf("Published incident event to RabbitMQ for URL: %s\n", target.URL)
 }
